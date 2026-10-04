@@ -97,13 +97,15 @@ func sampleEvent(poolName, poolNamespace, vmUID string, eventType poolmgrv1alpha
 	}
 }
 
-// fakePoolLifecycle records StartReconciler/StopReconciler calls for tests
-// that assert PoolAdminServer's wiring without a real poolmanager.Manager.
+// fakePoolLifecycle records StartReconciler/StopReconciler/
+// StopReconcilerAndWait calls for tests that assert PoolAdminServer's wiring
+// without a real poolmanager.Manager.
 type fakePoolLifecycle struct {
-	mu       sync.Mutex
-	started  []string
-	stopped  []string
-	startErr error
+	mu          sync.Mutex
+	started     []string
+	stopped     []string
+	startErr    error
+	stopWaitErr error // if set, StopReconcilerAndWait returns this
 }
 
 func (f *fakePoolLifecycle) StartReconciler(spec *poolmgrv1alpha1.PoolSpec) error {
@@ -117,6 +119,13 @@ func (f *fakePoolLifecycle) StopReconciler(name, _ string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.stopped = append(f.stopped, name)
+}
+
+func (f *fakePoolLifecycle) StopReconcilerAndWait(_ context.Context, name, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopped = append(f.stopped, name)
+	return f.stopWaitErr
 }
 
 // sampleAvailableVM returns a minimal AVAILABLE VMRecord for poolName on
@@ -143,6 +152,13 @@ type fakeMicroVM struct {
 	mu        sync.Mutex
 	deleted   []string
 	deleteErr error // if set, DeleteMicroVM returns this instead of succeeding
+	// hangUID, if set, makes DeleteMicroVM for that uid block until hangGate
+	// is closed (or the call's context ends), like an unresponsive host.
+	hangUID  string
+	hangGate chan struct{}
+	// onDelete, if set, runs inside each DeleteMicroVM before it answers, so
+	// a test can change the store while a delete is in flight.
+	onDelete func(uid string)
 }
 
 func (f *fakeMicroVM) GetMicroVM(_ context.Context, _ *microvmv1alpha1.GetMicroVMRequest) (*microvmv1alpha1.GetMicroVMResponse, error) {
@@ -158,10 +174,24 @@ func (f *fakeMicroVM) GetMicroVM(_ context.Context, _ *microvmv1alpha1.GetMicroV
 	}, nil
 }
 
-func (f *fakeMicroVM) DeleteMicroVM(_ context.Context, req *microvmv1alpha1.DeleteMicroVMRequest) (*emptypb.Empty, error) {
+func (f *fakeMicroVM) DeleteMicroVM(ctx context.Context, req *microvmv1alpha1.DeleteMicroVMRequest) (*emptypb.Empty, error) {
+	f.mu.Lock()
+	hangUID, hangGate := f.hangUID, f.hangGate
+	f.mu.Unlock()
+	if hangUID != "" && req.GetUid() == hangUID {
+		select {
+		case <-hangGate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.onDelete != nil {
+		f.onDelete(req.GetUid())
+	}
 	if f.deleteErr != nil {
 		return nil, f.deleteErr
 	}

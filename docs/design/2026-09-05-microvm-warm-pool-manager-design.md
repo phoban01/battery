@@ -144,6 +144,23 @@ external API.
 - `name`, `namespace`
 - `microvm_template`: a `flintlock.types.MicroVMSpec` template (vcpu, memory, kernel, volumes,
   interfaces, labels, metadata) — `allow_guest_agent` is always forced `true` server-side.
+  The rest of the template is sent to flintlock unchanged for every VM, so an interface's
+  `guest_mac` or static `address` would be shared by all of them. `CreatePool`/`UpdatePool`
+  reject a template that sets either with `InvalidArgument`, unless the pool never holds two
+  VMs at once: `size` at most 1, a strategy other than `IMMEDIATE_ON_LEASE` (which provisions
+  on every claim without counting leased VMs) and a `hook_failure_policy` other than
+  `QUARANTINE` (which keeps the failed VM, and nothing but deleting the pool removes it). Any
+  other pool must leave both unset, so flintlock generates the MAC and the guest uses DHCP.
+
+  The spec alone doesn't guarantee a single VM, so the reconciler also enforces it: for a
+  template with static network config it provisions at most one VM, and only when the pool
+  has no VM record left in any phase. This covers a VM that is still `DELETING` after a slow
+  or failed flintlock delete, a pool shrunk to `size: 1` that still has its old VMs, and a
+  pool stored before the rule existed (it is kept to one VM rather than rejected; a stored
+  `QUARANTINE` pool stops replenishing once it holds a quarantined VM). Not enforced:
+  - addresses configured through the template's cloud-init `metadata` are not inspected;
+  - a VM being provisioned by the previous reconciler when `UpdatePool` restarts it has no
+    VM record until flintlock accepts it, so the new reconciler can't see it in that window.
 - `size`: target pool size
 - `flintlock_hosts`: list of eligible host identifiers
 - `replenishment_strategy`: enum `IMMEDIATE_ON_LEASE | MIN_SIZE_THRESHOLD | REPLACE_ON_DELETE`
@@ -207,8 +224,8 @@ See the [idempotent claims ADR](../adr/2026-09-24-idempotent-claims.md).
    pool's `pre_lease_commands` via the guest-agent client (state → `PRE_LEASE_HOOK_RUNNING`),
    then transitions to `LEASED`, creates a `Lease` row, emits `VMClaimed`, decrements
    available count.
-   - If `IMMEDIATE_ON_LEASE` strategy: reconciler is nudged immediately to provision one
-     replacement VM.
+   - If `IMMEDIATE_ON_LEASE` strategy: reconciler is nudged immediately to top the warm set
+     back up to `size`.
 2. Consumer periodically calls `Heartbeat(lease_id)`; updates `last_heartbeat_at`/`expires_at`.
 3. Release happens via:
    - explicit `ReleaseVM(lease_id)` call, or
@@ -216,22 +233,40 @@ See the [idempotent claims ADR](../adr/2026-09-24-idempotent-claims.md).
    Either path: emit `VMExpiringSoon` (sweeper path, fired once, before the deadline — window
    configurable) → then on actual expiry/release, delete the VM via flintlock, emit
    `VMDeletedOnRelease`/`VMDeletedOnExpiry`, delete the `Lease` row.
-   - If `REPLACE_ON_DELETE` strategy: reconciler provisions a replacement immediately.
+   - If `REPLACE_ON_DELETE` strategy: reconciler is nudged immediately to top the pool back
+     up to `size` VMs in total.
 
 ## Replenishment Strategies
 
-- `IMMEDIATE_ON_LEASE`: on every successful claim, immediately start provisioning one new VM.
+- `IMMEDIATE_ON_LEASE`: keep `size` available VMs, leased VMs being extra. Every successful
+  claim immediately triggers a top-up.
 - `MIN_SIZE_THRESHOLD`: reconciler loop checks available count against `min_size`; when below,
   provisions up to `size`.
-- `REPLACE_ON_DELETE`: on every VM deletion (expiry, release-triggered, or hook failure), start
-  provisioning exactly one replacement.
+- `REPLACE_ON_DELETE`: keep `size` VMs in total, leased included. Every VM deletion (expiry,
+  release-triggered, or hook failure) immediately triggers a top-up.
 
-The two event-driven strategies (`IMMEDIATE_ON_LEASE`, `REPLACE_ON_DELETE`) would otherwise never
-fill a fresh, empty pool: nothing can be claimed or deleted, so nothing triggers replenishment.
-Each time a pool's reconciler starts (manager startup, `CreatePool`, `UpdatePool`) it therefore
-tops the pool up to `size` once — `size` available VMs for `IMMEDIATE_ON_LEASE` (leased VMs are
-extra), `size` VMs in total for `REPLACE_ON_DELETE`. `MIN_SIZE_THRESHOLD` needs no seed; its tick
-already does this.
+All three strategies are level-triggered: when a pool's reconciler starts (manager startup,
+`CreatePool`, `UpdatePool`) and on every tick, it counts the pool's VMs and provisions the whole
+shortfall against the strategy's target, rather than a fixed number per event. This is what fills
+a fresh, empty pool, where nothing can be claimed or deleted yet, and what recovers a pool after
+a provision fails or every host was cordoned: the next tick finds the pool still short and tries
+again.
+
+The two event-driven strategies also run that same top-up on a notification, a claim for
+`IMMEDIATE_ON_LEASE` and a delete for `REPLACE_ON_DELETE`, so it happens sooner than the next
+tick. Several notifications coalescing into one therefore lose nothing. `MIN_SIZE_THRESHOLD`
+ignores notifications and acts only at start and on ticks.
+
+A VM whose claim is still in progress (its pre-lease hook is running, or its lease isn't
+committed yet) counts toward every strategy's total, including the warm set of
+`IMMEDIATE_ON_LEASE`: it is replaced only once the lease commits, since until then the claim can
+still hand the VM back. A claim can't stay in progress across a restart: on startup, before any
+reconciler runs, the manager marks every VM that is claimed with no lease for deletion, so a
+claim abandoned by a crash doesn't hold a place in the pool forever.
+
+A VM in `DELETING` counts toward no strategy's total, so a `REPLACE_ON_DELETE` tick can start the
+replacement before the old VM's deletion completes. A failing provision is retried on every tick
+with no backoff.
 
 All strategies share the same provisioning pipeline: `CreateMicroVM` (flintlock) → poll
 `GetMicroVM` until `CREATED` with a non-empty `vsock_path` → guest-agent `WaitReady` → run

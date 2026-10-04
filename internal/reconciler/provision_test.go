@@ -490,6 +490,31 @@ func TestProvision_CreateVMFailure_ReleasesReservation(t *testing.T) {
 	}
 }
 
+// TestProvision_CreateVMFailsOnCancelledContext_StillDeletesOrphan: when the
+// reconciler is stopped (its pool updated or deleted) just after flintlock
+// created the microvm, the store write fails on the cancelled context. The
+// orphaned microvm must still be deleted, or it runs on with no record.
+func TestProvision_CreateVMFailsOnCancelledContext_StillDeletesOrphan(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	st := &failingStore{Store: openTestStore(t), failCreateVM: true, onCreateVM: cancel}
+	seedHost(t, st, "host-a")
+
+	vm := &fakeMicroVM{}
+	flint := startFakeFlintlock(t, vm, alwaysReadyExec())
+
+	pool := samplePool("pool-a", poolmgrv1alpha1.ReplenishmentStrategyType_MIN_SIZE_THRESHOLD, 1, []string{"host-a"})
+	p := reconciler.NewProvisioner(st, flint, fastProvisionConfig(), nil)
+
+	if err := p.Provision(ctx, pool); !errors.Is(err, errInjected) {
+		t.Fatalf("Provision() error = %v, want wrapped errInjected", err)
+	}
+	if got := vm.deletedUIDs(); len(got) != 1 {
+		t.Fatalf("flintlock deleted uids = %v, want the one orphaned microvm", got)
+	}
+}
+
 // TestProvision_UnknownHost: a host that is registered but missing from the
 // client pool (its stored spec failed to dial at startup) surfaces the
 // client pool's ErrUnknownHost.

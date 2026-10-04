@@ -84,6 +84,15 @@ func main() {
 	if err := clearStalePlacements(ctx, st); err != nil {
 		fatal("poolmgrd: clear stale placements", err)
 	}
+	// Must run before any reconciler, the sweeper or the API server starts:
+	// see reconciler.RecoverAbandonedClaims.
+	recovered, err := reconciler.RecoverAbandonedClaims(ctx, st)
+	if err != nil {
+		fatal("poolmgrd: recover abandoned claims", err)
+	}
+	if recovered > 0 {
+		slog.Warn("poolmgrd: marked microvms left claimed with no lease for deletion", "count", recovered)
+	}
 
 	// The store is the only source of hosts: HostAdmin.AddHost writes them
 	// there, with their TLS settings, and the pool is built from it.
@@ -224,7 +233,7 @@ func buildGRPCServer(cfg config.APIServerConfig, st store.Store, flint *flintloc
 		return nil, fmt.Errorf("build grpc server: %w", err)
 	}
 
-	poolmgrv1alpha1.RegisterPoolAdminServer(srv, api.NewPoolAdminServer(st, poolMgr))
+	poolmgrv1alpha1.RegisterPoolAdminServer(srv, api.NewPoolAdminServer(st, flint, poolMgr))
 	poolmgrv1alpha1.RegisterLeaseServer(srv, api.NewLeaseServer(st, flint, api.HookExecConfig{}, poolMgr, reg))
 	poolmgrv1alpha1.RegisterEventsServer(srv, api.NewEventsServer(st, 0, 0))
 	poolmgrv1alpha1.RegisterHostAdminServer(srv, api.NewHostAdminServer(st, flint))

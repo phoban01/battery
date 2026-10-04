@@ -23,6 +23,7 @@ type failingStore struct {
 	store.Store
 
 	failCreateVM            bool
+	onCreateVM              func() // if set, called at the start of CreateVM
 	failUpdateVMPhase       *poolmgrv1alpha1.VMPhase
 	cordonHostBeforeReserve string
 	removeHostBeforeReserve string
@@ -43,6 +44,9 @@ func (f *failingStore) ReservePlacement(ctx context.Context, id, host, poolName,
 }
 
 func (f *failingStore) CreateVM(ctx context.Context, v *poolmgrv1alpha1.VMRecord) error {
+	if f.onCreateVM != nil {
+		f.onCreateVM()
+	}
 	if f.failCreateVM {
 		return errInjected
 	}
